@@ -1,0 +1,346 @@
+// ==================================================
+// AI Recruiter Voice Agent — Prisma Schema
+// ==================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ==================================================
+// ENUMS
+// ==================================================
+
+enum UserRole {
+  ADMIN
+  RECRUITER
+}
+
+enum JobStatus {
+  DRAFT
+  PUBLISHED
+  CLOSED
+}
+
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+  INTERNSHIP
+  REMOTE
+}
+
+enum ApplicationStatus {
+  APPLIED
+  SCREENING
+  INVITED
+  INTERVIEW_SCHEDULED
+  INTERVIEW_COMPLETED
+  SHORTLISTED
+  REJECTED
+  HIRED
+}
+
+enum InterviewStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  EXPIRED
+}
+
+enum MessageSender {
+  AI
+  CANDIDATE
+}
+
+enum MessageStage {
+  GREETING
+  IDENTITY_VERIFICATION
+  INTRODUCTION
+  TECHNICAL
+  BEHAVIORAL
+  FOLLOW_UP
+  CROSS_QUESTION
+  CONCLUSION
+}
+
+enum NotificationType {
+  INTERVIEW_SCHEDULED
+  INTERVIEW_COMPLETED
+  CANDIDATE_SHORTLISTED
+  CANDIDATE_REJECTED
+  REPORT_READY
+  SYSTEM
+}
+
+enum Recommendation {
+  STRONG_HIRE
+  HIRE
+  MAYBE
+  NO_HIRE
+  STRONG_NO_HIRE
+}
+
+// ==================================================
+// CORE MODELS
+// ==================================================
+
+/// A recruiter or admin. Mirrors Clerk's user via clerkId.
+model User {
+  id        String   @id @default(cuid())
+  clerkId   String   @unique
+  email     String   @unique
+  firstName String?
+  lastName  String?
+  imageUrl  String?
+  role      UserRole @default(RECRUITER)
+  companyName String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  jobs          Job[]
+  notifications Notification[]
+  recruiterNotes RecruiterNote[]
+
+  @@index([email])
+  @@map("users")
+}
+
+model Job {
+  id             String         @id @default(cuid())
+  title          String
+  description    String         @db.Text
+  experience     String
+  salaryMin      Int?
+  salaryMax      Int?
+  skills         String[]
+  location       String
+  employmentType EmploymentType @default(FULL_TIME)
+  status         JobStatus      @default(DRAFT)
+
+  createdBy   User   @relation(fields: [createdById], references: [id], onDelete: Cascade)
+  createdById String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  publishedAt DateTime?
+  closedAt    DateTime?
+
+  applications Application[]
+
+  @@index([createdById])
+  @@index([status])
+  @@map("jobs")
+}
+
+/// A candidate is global (not scoped to one job) — they can apply to many jobs.
+model Candidate {
+  id    String @id @default(cuid())
+  name  String
+  email String @unique
+  phone String?
+
+  resumeUrl  String
+  resumeText String? @db.Text
+
+  experience Json? // structured: [{ company, title, years, description }]
+  education  Json? // structured: [{ institution, degree, field, year }]
+  skills     String[]
+  projects   Json? // structured: [{ name, description, techStack }]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  applications Application[]
+
+  @@index([email])
+  @@map("candidates")
+}
+
+/// Join entity: one candidate applying to one job. Owns the ranking + funnel state.
+model Application {
+  id String @id @default(cuid())
+
+  job         Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId       String
+  candidate   Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  candidateId String
+
+  status ApplicationStatus @default(APPLIED)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  resumeAnalysis ResumeAnalysis?
+  interview      Interview?
+  recruiterNotes RecruiterNote[]
+
+  @@unique([jobId, candidateId])
+  @@index([jobId])
+  @@index([candidateId])
+  @@index([status])
+  @@map("applications")
+}
+
+/// AI-generated resume-vs-JD scoring for a specific application.
+model ResumeAnalysis {
+  id String @id @default(cuid())
+
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  applicationId String      @unique
+
+  overallScore     Float
+  skillMatch       Float
+  experienceMatch  Float
+  educationMatch   Float
+  strengths        String[]
+  weaknesses       String[]
+  rankPosition     Int?
+
+  rawModelOutput Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([applicationId])
+  @@map("resume_analyses")
+}
+
+/// One interview instance tied 1:1 to an application.
+model Interview {
+  id String @id @default(cuid())
+
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  applicationId String      @unique
+
+  status      InterviewStatus @default(SCHEDULED)
+  accessToken String          @unique @default(cuid()) // used in the emailed interview link
+
+  scheduledAt DateTime?
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  session InterviewSession?
+  report  Report?
+
+  @@index([applicationId])
+  @@index([status])
+  @@map("interviews")
+}
+
+/// The live/completed session data: transcript + audio artifacts for one interview.
+model InterviewSession {
+  id String @id @default(cuid())
+
+  interview   Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  interviewId String    @unique
+
+  currentStage MessageStage @default(GREETING)
+  audioUrl     String? // full recorded session, if stored
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages Message[]
+
+  @@map("interview_sessions")
+}
+
+/// One turn in the conversation (AI question or candidate answer).
+model Message {
+  id String @id @default(cuid())
+
+  session   InterviewSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sessionId String
+
+  sender  MessageSender
+  stage   MessageStage
+  content String        @db.Text
+
+  audioUrl   String? // Murf-generated TTS (AI) or recorded clip (candidate)
+  confidence Float? // Whisper STT confidence, candidate turns only
+
+  createdAt DateTime @default(now())
+
+  @@index([sessionId])
+  @@map("messages")
+}
+
+/// GPT evaluation + generated report for a completed interview.
+model Report {
+  id String @id @default(cuid())
+
+  interview   Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  interviewId String    @unique
+
+  communication  Float
+  confidence     Float
+  problemSolving Float
+  technicalSkill Float
+  behavior       Float
+  leadership     Float
+  overallRating  Float
+
+  recommendation Recommendation
+
+  strengths   String[]
+  weaknesses  String[]
+  summary     String   @db.Text
+  markdownUrl String? // stored markdown report (UploadThing)
+  pdfUrl      String? // stored PDF report (UploadThing)
+
+  rawModelOutput Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("reports")
+}
+
+/// Manual recruiter notes on an application — separate from AI output.
+model RecruiterNote {
+  id String @id @default(cuid())
+
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  applicationId String
+
+  author   User   @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  authorId String
+
+  content String @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([applicationId])
+  @@map("recruiter_notes")
+}
+
+model Notification {
+  id String @id @default(cuid())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId String
+
+  type    NotificationType
+  title   String
+  message String
+  read    Boolean          @default(false)
+  link    String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([read])
+  @@map("notifications")
+}
